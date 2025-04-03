@@ -1,15 +1,4 @@
 
-;; title: Decentralized-Micro-Lending
-;; version:
-;; summary:
-;; description:
-
-;; traits
-;;
-
-;; token definitions
-;;
-
 ;; constants
 ;;;; title: Decentralized-Micro-Lending
 ;; version: 1.0

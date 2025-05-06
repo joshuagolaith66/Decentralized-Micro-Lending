@@ -323,3 +323,91 @@
   )
 )
 
+
+
+(define-constant ERR-EXTENSION-NOT-ALLOWED (err u111))
+(define-constant EXTENSION-FEE-PERCENTAGE u5)
+(define-constant MAX-EXTENSIONS u2)
+
+(define-map loan-extensions 
+  { loan-id: uint }
+  { extension-count: uint }
+)
+
+(define-public (extend-loan (loan-id uint) (additional-blocks uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (extension-data (default-to { extension-count: u0 } (map-get? loan-extensions { loan-id: loan-id })))
+      (extension-fee (/ (* (get amount loan) EXTENSION-FEE-PERCENTAGE) u100))
+    )
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-BORROWER)
+    (asserts! (is-eq (get status loan) u1) ERR-LOAN-NOT-FUNDED)
+    (asserts! (< (get extension-count extension-data) MAX-EXTENSIONS) ERR-EXTENSION-NOT-ALLOWED)
+    
+    (try! (stx-transfer? extension-fee tx-sender CONTRACT-OWNER))
+    
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan { term-length: (+ (get term-length loan) additional-blocks) })
+    )
+    
+    (map-set loan-extensions
+      { loan-id: loan-id }
+      { extension-count: (+ (get extension-count extension-data) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+
+(define-map borrower-stats
+  { borrower: principal }
+  {
+    loans-taken: uint,
+    loans-repaid: uint,
+    loans-defaulted: uint
+  }
+)
+
+(define-read-only (get-loan-risk-score (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (borrower-data (default-to { loans-taken: u0, loans-repaid: u0, loans-defaulted: u0 } 
+                     (map-get? borrower-stats { borrower: (get borrower loan) })))
+      (collateral-ratio (/ (* (get collateral loan) u100) (get amount loan)))
+      (repayment-ratio (if (is-eq (get loans-taken borrower-data) u0)
+                          u100
+                          (/ (* (get loans-repaid borrower-data) u100) (get loans-taken borrower-data))))
+    )
+    (ok {
+      risk-score: (/ (+ collateral-ratio repayment-ratio) u2),
+      collateral-ratio: collateral-ratio,
+      repayment-history: repayment-ratio
+    })
+  )
+)
+
+(define-public (update-borrower-stats (borrower principal) (status uint))
+  (let
+    (
+      (stats (default-to { loans-taken: u0, loans-repaid: u0, loans-defaulted: u0 }
+              (map-get? borrower-stats { borrower: borrower })))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    (map-set borrower-stats
+      { borrower: borrower }
+      (merge stats
+        {
+          loans-taken: (+ (get loans-taken stats) u1),
+          loans-repaid: (if (is-eq status u2) (+ (get loans-repaid stats) u1) (get loans-repaid stats)),
+          loans-defaulted: (if (is-eq status u3) (+ (get loans-defaulted stats) u1) (get loans-defaulted stats))
+        }
+      )
+    )
+    (ok true)
+  )
+)

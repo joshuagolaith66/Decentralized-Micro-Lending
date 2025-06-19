@@ -411,3 +411,170 @@
     (ok true)
   )
 )
+
+
+(define-constant ERR-INTEREST-CALCULATION-FAILED (err u112))
+(define-constant COMPOUNDING-FREQUENCY u144)
+
+(define-map loan-interest-data
+  { loan-id: uint }
+  {
+    principal-amount: uint,
+    accrued-interest: uint,
+    last-compound-block: uint,
+    compound-count: uint
+  }
+)
+
+(define-data-var total-accrued-interest uint u0)
+
+(define-public (initialize-compound-interest (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get status loan) u1) ERR-LOAN-NOT-FUNDED)
+    (asserts! (is-none (map-get? loan-interest-data { loan-id: loan-id })) ERR-LOAN-ALREADY-FUNDED)
+    
+    (map-set loan-interest-data
+      { loan-id: loan-id }
+      {
+        principal-amount: (get amount loan),
+        accrued-interest: u0,
+        last-compound-block: current-block,
+        compound-count: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (compound-loan-interest (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (interest-data (unwrap! (map-get? loan-interest-data { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (current-block stacks-block-height)
+      (blocks-since-last-compound (- current-block (get last-compound-block interest-data)))
+      (periods-to-compound (/ blocks-since-last-compound COMPOUNDING-FREQUENCY))
+    )
+    (asserts! (is-eq (get status loan) u1) ERR-LOAN-NOT-FUNDED)
+    (asserts! (> periods-to-compound u0) ERR-INTEREST-CALCULATION-FAILED)
+    
+    (let
+      (
+        (current-principal (+ (get principal-amount interest-data) (get accrued-interest interest-data)))
+        (period-rate (/ (get interest-rate loan) u10000))
+        (compound-multiplier (+ u10000 period-rate))
+        (new-amount (/ (* current-principal compound-multiplier) u10000))
+        (new-interest (- new-amount (get principal-amount interest-data)))
+        (interest-increase (- new-interest (get accrued-interest interest-data)))
+      )
+      
+      (map-set loan-interest-data
+        { loan-id: loan-id }
+        {
+          principal-amount: (get principal-amount interest-data),
+          accrued-interest: new-interest,
+          last-compound-block: current-block,
+          compound-count: (+ (get compound-count interest-data) periods-to-compound)
+        }
+      )
+      
+      (var-set total-accrued-interest (+ (var-get total-accrued-interest) interest-increase))
+      (ok new-interest)
+    )
+  )
+)
+
+(define-public (repay-compound-loan (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (interest-data (unwrap! (map-get? loan-interest-data { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FUNDED))
+    )
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-BORROWER)
+    (asserts! (is-eq (get status loan) u1) ERR-LOAN-NOT-FUNDED)
+    
+    (try! (compound-loan-interest loan-id))
+    
+    (let
+      (
+        (updated-interest-data (unwrap! (map-get? loan-interest-data { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+        (total-repayment (+ (get principal-amount updated-interest-data) (get accrued-interest updated-interest-data)))
+        (platform-fee (/ (* total-repayment (var-get platform-fee-percentage)) u100))
+        (lender-amount (- total-repayment platform-fee))
+      )
+      
+      (try! (stx-transfer? lender-amount tx-sender lender))
+      (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
+      (try! (as-contract (stx-transfer? (get collateral loan) tx-sender (get borrower loan))))
+      
+      (map-set loans
+        { loan-id: loan-id }
+        (merge loan {
+          status: u2,
+          repaid-at: (some stacks-block-height)
+        })
+      )
+      
+      (var-set total-active-loans (- (var-get total-active-loans) u1))
+      (var-set total-repaid-loans (+ (var-get total-repaid-loans) u1))
+      
+      (ok total-repayment)
+    )
+  )
+)
+
+(define-read-only (get-compound-interest-data (loan-id uint))
+  (map-get? loan-interest-data { loan-id: loan-id })
+)
+
+(define-read-only (calculate-current-compound-amount (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (interest-data (unwrap! (map-get? loan-interest-data { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (current-block stacks-block-height)
+      (blocks-since-last-compound (- current-block (get last-compound-block interest-data)))
+      (periods-to-compound (/ blocks-since-last-compound COMPOUNDING-FREQUENCY))
+    )
+    (if (is-eq periods-to-compound u0)
+      (ok (+ (get principal-amount interest-data) (get accrued-interest interest-data)))
+      (let
+        (
+          (current-principal (+ (get principal-amount interest-data) (get accrued-interest interest-data)))
+          (period-rate (/ (get interest-rate loan) u10000))
+          (compound-multiplier (+ u10000 period-rate))
+          (new-amount (/ (* current-principal compound-multiplier) u10000))
+        )
+        (ok new-amount)
+      )
+    )
+  )
+)
+
+(define-read-only (get-total-platform-interest)
+  (var-get total-accrued-interest)
+)
+
+(define-read-only (get-loan-compound-summary (loan-id uint))
+  (let
+    (
+      (interest-data (map-get? loan-interest-data { loan-id: loan-id }))
+      (current-amount (calculate-current-compound-amount loan-id))
+    )
+    (match interest-data
+      data (ok {
+        principal: (get principal-amount data),
+        accrued-interest: (get accrued-interest data),
+        current-total: (unwrap-panic current-amount),
+        compound-periods: (get compound-count data),
+        last-compound-block: (get last-compound-block data)
+      })
+      ERR-LOAN-NOT-FOUND
+    )
+  )
+)

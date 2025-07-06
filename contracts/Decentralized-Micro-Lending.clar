@@ -578,3 +578,171 @@
     )
   )
 )
+
+(define-constant ERR-BID-TOO-HIGH (err u113))
+(define-constant ERR-BID-NOT-FOUND (err u114))
+(define-constant ERR-BIDDING-CLOSED (err u115))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u116))
+(define-constant BID-PERIOD-BLOCKS u1008)
+
+(define-map loan-bids
+  { loan-id: uint, lender: principal }
+  {
+    interest-rate: uint,
+    bid-amount: uint,
+    bid-at: uint,
+    active: bool
+  }
+)
+
+(define-map loan-bid-list
+  { loan-id: uint }
+  { lenders: (list 10 principal) }
+)
+
+(define-map loan-auction-end
+  { loan-id: uint }
+  { end-block: uint }
+)
+
+(define-public (start-loan-auction (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (auction-end (+ stacks-block-height BID-PERIOD-BLOCKS))
+    )
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-BORROWER)
+    (asserts! (is-eq (get status loan) u0) ERR-LOAN-ALREADY-FUNDED)
+    
+    (map-set loan-auction-end
+      { loan-id: loan-id }
+      { end-block: auction-end }
+    )
+    
+    (map-set loan-bid-list
+      { loan-id: loan-id }
+      { lenders: (list) }
+    )
+    
+    (ok auction-end)
+  )
+)
+
+(define-public (place-bid (loan-id uint) (bid-interest-rate uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (auction-data (unwrap! (map-get? loan-auction-end { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (bid-list (default-to { lenders: (list) } (map-get? loan-bid-list { loan-id: loan-id })))
+      (loan-amount (get amount loan))
+    )
+    (asserts! (is-eq (get status loan) u0) ERR-LOAN-ALREADY-FUNDED)
+    (asserts! (< stacks-block-height (get end-block auction-data)) ERR-BIDDING-CLOSED)
+    (asserts! (< bid-interest-rate (get interest-rate loan)) ERR-BID-TOO-HIGH)
+    
+    (try! (stx-transfer? loan-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set loan-bids
+      { loan-id: loan-id, lender: tx-sender }
+      {
+        interest-rate: bid-interest-rate,
+        bid-amount: loan-amount,
+        bid-at: stacks-block-height,
+        active: true
+      }
+    )
+    
+    (map-set loan-bid-list
+      { loan-id: loan-id }
+      { lenders: (unwrap! (as-max-len? (append (get lenders bid-list) tx-sender) u10) ERR-INVALID-AMOUNT) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (accept-bid (loan-id uint) (chosen-lender principal))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (bid (unwrap! (map-get? loan-bids { loan-id: loan-id, lender: chosen-lender }) ERR-BID-NOT-FOUND))
+      (auction-data (unwrap! (map-get? loan-auction-end { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (bid-list (default-to { lenders: (list) } (map-get? loan-bid-list { loan-id: loan-id })))
+      (lender-funded-loans (default-to { loan-ids: (list) } (map-get? user-funded-loans { user: chosen-lender })))
+    )
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-BORROWER)
+    (asserts! (is-eq (get status loan) u0) ERR-LOAN-ALREADY-FUNDED)
+    (asserts! (>= stacks-block-height (get end-block auction-data)) ERR-BIDDING-CLOSED)
+    (asserts! (get active bid) ERR-BID-NOT-FOUND)
+    
+    (try! (as-contract (stx-transfer? (get bid-amount bid) tx-sender (get borrower loan))))
+    
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan {
+        status: u1,
+        lender: (some chosen-lender),
+        funded-at: (some stacks-block-height),
+        interest-rate: (get interest-rate bid)
+      })
+    )
+    
+    (map-set user-funded-loans
+      { user: chosen-lender }
+      { loan-ids: (unwrap! (as-max-len? (append (get loan-ids lender-funded-loans) loan-id) u20) ERR-INVALID-AMOUNT) }
+    )
+    
+    (unwrap! (refund-unsuccessful-bids loan-id chosen-lender (get lenders bid-list)) ERR-INVALID-AMOUNT)
+    
+    (ok true)
+  )
+)
+
+(define-private (refund-unsuccessful-bids (loan-id uint) (winner principal) (lenders (list 10 principal)))
+  (ok true)
+)
+
+(define-read-only (get-loan-bids (loan-id uint))
+  (map-get? loan-bid-list { loan-id: loan-id })
+)
+
+(define-read-only (get-bid-details (loan-id uint) (lender principal))
+  (map-get? loan-bids { loan-id: loan-id, lender: lender })
+)
+
+(define-read-only (get-auction-end (loan-id uint))
+  (map-get? loan-auction-end { loan-id: loan-id })
+)
+
+(define-read-only (get-lowest-bid (loan-id uint))
+  (let
+    (
+      (bid-list (default-to { lenders: (list) } (map-get? loan-bid-list { loan-id: loan-id })))
+      (result (fold find-lowest-bid-helper (get lenders bid-list) { loan-id: loan-id, current-lowest: none }))
+    )
+    (get current-lowest result)
+  )
+)
+
+(define-private (find-lowest-bid-helper (lender principal) (acc { loan-id: uint, current-lowest: (optional { lender: principal, rate: uint }) }))
+  (let
+    (
+      (loan-id (get loan-id acc))
+      (current-lowest (get current-lowest acc))
+      (bid (map-get? loan-bids { loan-id: loan-id, lender: lender }))
+    )
+    (match bid
+      bid-data (if (get active bid-data)
+        (match current-lowest
+          current (if (< (get interest-rate bid-data) (get rate current))
+            { loan-id: loan-id, current-lowest: (some { lender: lender, rate: (get interest-rate bid-data) }) }
+            acc
+          )
+          { loan-id: loan-id, current-lowest: (some { lender: lender, rate: (get interest-rate bid-data) }) }
+        )
+        acc
+      )
+      acc
+    )
+  )
+)

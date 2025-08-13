@@ -714,6 +714,323 @@
   (map-get? loan-auction-end { loan-id: loan-id })
 )
 
+;; === INSURANCE POOL SYSTEM ===
+;; Community-driven insurance pool to protect lenders against defaults
+
+;; Insurance pool constants
+(define-constant ERR-INSUFFICIENT-POOL-FUNDS (err u117))
+(define-constant ERR-CLAIM-ALREADY-PROCESSED (err u118))
+(define-constant ERR-CLAIM-NOT-APPROVED (err u119))
+(define-constant ERR-NOT-POOL-CONTRIBUTOR (err u120))
+(define-constant ERR-WITHDRAWAL-TOO-LARGE (err u121))
+(define-constant POOL-REWARD-PERCENTAGE u10) ;; 10% of successful loan interest goes to pool
+(define-constant MIN-POOL-CONTRIBUTION u1000000) ;; 1 STX minimum
+(define-constant CLAIM-VOTING-PERIOD u144) ;; 1 day for claim voting
+
+;; Insurance pool data variables
+(define-data-var total-pool-balance uint u0)
+(define-data-var total-pool-contributors uint u0)
+(define-data-var next-claim-id uint u1)
+(define-data-var pool-reward-accumulated uint u0)
+
+;; Pool contributor tracking
+(define-map pool-contributors
+  { contributor: principal }
+  {
+    contribution-amount: uint,
+    contribution-blocks: uint,
+    total-rewards-earned: uint,
+    last-reward-claim: uint
+  }
+)
+
+;; Insurance claims for defaulted loans
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    loan-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    submitted-at: uint,
+    status: uint, ;; 0=pending, 1=approved, 2=rejected, 3=paid
+    votes-for: uint,
+    votes-against: uint,
+    voting-deadline: uint
+  }
+)
+
+;; Claim voting tracking
+(define-map claim-votes
+  { claim-id: uint, voter: principal }
+  { vote: bool, voting-power: uint }
+)
+
+;; Contributor list for iteration
+(define-map contributor-list
+  { index: uint }
+  { contributor: principal }
+)
+
+(define-data-var contributor-count uint u0)
+
+;; Contribute to insurance pool
+(define-public (contribute-to-pool (amount uint))
+  (let
+    (
+      (current-contribution (default-to 
+        { contribution-amount: u0, contribution-blocks: u0, total-rewards-earned: u0, last-reward-claim: u0 }
+        (map-get? pool-contributors { contributor: tx-sender })))
+      (new-total-contribution (+ (get contribution-amount current-contribution) amount))
+    )
+    ;; Validate minimum contribution
+    (asserts! (>= amount MIN-POOL-CONTRIBUTION) ERR-INVALID-AMOUNT)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update pool balance
+    (var-set total-pool-balance (+ (var-get total-pool-balance) amount))
+    
+    ;; Update or create contributor record
+    (if (is-eq (get contribution-amount current-contribution) u0)
+      (begin
+        ;; New contributor
+        (map-set contributor-list 
+          { index: (var-get contributor-count) }
+          { contributor: tx-sender })
+        (var-set contributor-count (+ (var-get contributor-count) u1))
+        (var-set total-pool-contributors (+ (var-get total-pool-contributors) u1))
+      )
+      true
+    )
+    
+    (map-set pool-contributors
+      { contributor: tx-sender }
+      {
+        contribution-amount: new-total-contribution,
+        contribution-blocks: stacks-block-height,
+        total-rewards-earned: (get total-rewards-earned current-contribution),
+        last-reward-claim: (get last-reward-claim current-contribution)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Withdraw from insurance pool (partial withdrawals allowed)
+(define-public (withdraw-from-pool (amount uint))
+  (let
+    (
+      (contributor-data (unwrap! (map-get? pool-contributors { contributor: tx-sender }) ERR-NOT-POOL-CONTRIBUTOR))
+      (available-amount (get contribution-amount contributor-data))
+    )
+    ;; Check withdrawal amount
+    (asserts! (<= amount available-amount) ERR-WITHDRAWAL-TOO-LARGE)
+    (asserts! (>= (var-get total-pool-balance) amount) ERR-INSUFFICIENT-POOL-FUNDS)
+    
+    ;; Transfer STX back to contributor
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    ;; Update balances
+    (var-set total-pool-balance (- (var-get total-pool-balance) amount))
+    
+    (let ((new-contribution-amount (- available-amount amount)))
+      (if (is-eq new-contribution-amount u0)
+        ;; Remove contributor if zero contribution
+        (begin
+          (map-delete pool-contributors { contributor: tx-sender })
+          (var-set total-pool-contributors (- (var-get total-pool-contributors) u1))
+        )
+        ;; Update contribution amount
+        (map-set pool-contributors
+          { contributor: tx-sender }
+          (merge contributor-data { contribution-amount: new-contribution-amount })
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Submit insurance claim for defaulted loan
+(define-public (submit-insurance-claim (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FUNDED))
+      (claim-id (var-get next-claim-id))
+      (claim-amount (get amount loan))
+    )
+    ;; Verify caller is the lender
+    (asserts! (is-eq tx-sender lender) ERR-NOT-LENDER)
+    ;; Verify loan is defaulted
+    (asserts! (is-eq (get status loan) u3) ERR-LOAN-NOT-DEFAULTED)
+    ;; Check if pool has sufficient funds
+    (asserts! (>= (var-get total-pool-balance) claim-amount) ERR-INSUFFICIENT-POOL-FUNDS)
+    
+    ;; Create insurance claim
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      {
+        loan-id: loan-id,
+        claimant: lender,
+        claim-amount: claim-amount,
+        submitted-at: stacks-block-height,
+        status: u0, ;; Pending
+        votes-for: u0,
+        votes-against: u0,
+        voting-deadline: (+ stacks-block-height CLAIM-VOTING-PERIOD)
+      }
+    )
+    
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+;; Vote on insurance claim (pool contributors only)
+(define-public (vote-on-claim (claim-id uint) (approve bool))
+  (let
+    (
+      (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-LOAN-NOT-FOUND))
+      (contributor (unwrap! (map-get? pool-contributors { contributor: tx-sender }) ERR-NOT-POOL-CONTRIBUTOR))
+      (voting-power (get contribution-amount contributor))
+    )
+    ;; Check voting deadline
+    (asserts! (< stacks-block-height (get voting-deadline claim)) ERR-INVALID-AMOUNT)
+    ;; Check claim is still pending
+    (asserts! (is-eq (get status claim) u0) ERR-CLAIM-ALREADY-PROCESSED)
+    
+    ;; Record vote
+    (map-set claim-votes
+      { claim-id: claim-id, voter: tx-sender }
+      { vote: approve, voting-power: voting-power }
+    )
+    
+    ;; Update claim vote counts
+    (if approve
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim { votes-for: (+ (get votes-for claim) voting-power) })
+      )
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim { votes-against: (+ (get votes-against claim) voting-power) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Process insurance claim after voting period
+(define-public (process-insurance-claim (claim-id uint))
+  (let
+    (
+      (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-LOAN-NOT-FOUND))
+      (total-votes (+ (get votes-for claim) (get votes-against claim)))
+      (claim-approved (> (get votes-for claim) (get votes-against claim)))
+    )
+    ;; Check voting deadline has passed
+    (asserts! (>= stacks-block-height (get voting-deadline claim)) ERR-INVALID-AMOUNT)
+    ;; Check claim is still pending
+    (asserts! (is-eq (get status claim) u0) ERR-CLAIM-ALREADY-PROCESSED)
+    
+    (if claim-approved
+      ;; Approve and pay claim
+      (begin
+        (try! (as-contract (stx-transfer? (get claim-amount claim) tx-sender (get claimant claim))))
+        (var-set total-pool-balance (- (var-get total-pool-balance) (get claim-amount claim)))
+        (map-set insurance-claims
+          { claim-id: claim-id }
+          (merge claim { status: u3 }) ;; Paid
+        )
+      )
+      ;; Reject claim
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim { status: u2 }) ;; Rejected
+      )
+    )
+    
+    (ok claim-approved)
+  )
+)
+
+;; Distribute rewards to pool contributors from successful loan interest
+(define-public (distribute-pool-rewards (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      (interest-amount (/ (* (get amount loan) (get interest-rate loan)) u10000))
+      (pool-reward (/ (* interest-amount POOL-REWARD-PERCENTAGE) u100))
+    )
+    ;; Verify loan was successfully repaid
+    (asserts! (is-eq (get status loan) u2) ERR-LOAN-ALREADY-REPAID)
+    ;; Only contract owner can distribute rewards
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    ;; Add to accumulated pool rewards
+    (var-set pool-reward-accumulated (+ (var-get pool-reward-accumulated) pool-reward))
+    
+    (ok true)
+  )
+)
+
+;; Claim accumulated pool rewards (proportional to contribution)
+(define-public (claim-pool-rewards)
+  (let
+    (
+      (contributor (unwrap! (map-get? pool-contributors { contributor: tx-sender }) ERR-NOT-POOL-CONTRIBUTOR))
+      (total-rewards (var-get pool-reward-accumulated))
+      (contributor-share (/ (* total-rewards (get contribution-amount contributor)) (var-get total-pool-balance)))
+    )
+    ;; Check if there are rewards to distribute
+    (asserts! (> contributor-share u0) ERR-INVALID-AMOUNT)
+    
+    ;; Transfer reward share
+    (try! (as-contract (stx-transfer? contributor-share tx-sender tx-sender)))
+    
+    ;; Update contributor's reward tracking
+    (map-set pool-contributors
+      { contributor: tx-sender }
+      (merge contributor {
+        total-rewards-earned: (+ (get total-rewards-earned contributor) contributor-share),
+        last-reward-claim: stacks-block-height
+      })
+    )
+    
+    ;; Reduce accumulated rewards
+    (var-set pool-reward-accumulated (- total-rewards contributor-share))
+    
+    (ok contributor-share)
+  )
+)
+
+;; Read-only functions for insurance pool
+
+(define-read-only (get-pool-stats)
+  {
+    total-balance: (var-get total-pool-balance),
+    total-contributors: (var-get total-pool-contributors),
+    accumulated-rewards: (var-get pool-reward-accumulated)
+  }
+)
+
+(define-read-only (get-contributor-info (contributor principal))
+  (map-get? pool-contributors { contributor: contributor })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-claim-vote (claim-id uint) (voter principal))
+  (map-get? claim-votes { claim-id: claim-id, voter: voter })
+)
+
 (define-read-only (get-lowest-bid (loan-id uint))
   (let
     (
